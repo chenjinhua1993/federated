@@ -14,6 +14,5 @@ py_library(
     deps = [
         "//tensorflow_federated/python/simulation:hdf5_client_data",
         "//tensorflow_federated/python/simulation:transforming_client_data",
-        "@org_tensorflow//tensorflow:tensorflow_py",
     ],
 )
