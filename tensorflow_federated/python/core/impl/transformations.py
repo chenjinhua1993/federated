@@ -112,14 +112,14 @@ def replace_intrinsic_with_callable(comp, uri, body, context_stack):
 def replace_called_lambda_with_block(comp):
   r"""Replaces all the called lambdas in `comp` with a block.
 
-  This transform traverses `comp` postorder, matches the following pattern `*`,
-  and replaces the following computation containing a called lambda:
+  This transform traverses `comp` postorder, matches the following pattern, and
+  replaces the following computation containing a called lambda:
 
-            *Call
-            /    \
-  *Lambda(x)      Comp(y)
-            \
-             Comp(z)
+            Call
+           /    \
+  Lambda(x)      Comp(y)
+           \
+            Comp(z)
 
   (x -> z)(y)
 
@@ -164,17 +164,17 @@ def replace_called_lambda_with_block(comp):
 def remove_mapped_or_applied_identity(comp):
   r"""Removes all the mapped or applied identity functions in `comp`.
 
-  This transform traverses `comp` postorder, matches the following pattern `*`,
-  and removes all the mapped or applied identity fucntions by replacing the
+  This transform traverses `comp` postorder, matches the following pattern, and
+  removes all the mapped or applied identity fucntions by replacing the
   following computation:
 
-            *Call
-            /    \
-  *Intrinsic     *Tuple
-                  |
-                  [*Lambda(x), Comp(y)]
-                             \
-                             *Ref(x)
+            Call
+           /    \
+  Intrinsic      Tuple
+                 |
+                 [Lambda(x), Comp(y)]
+                           \
+                            Ref(x)
 
   Intrinsic(<(x -> x), y>)
 
@@ -222,37 +222,41 @@ def remove_mapped_or_applied_identity(comp):
 def replace_chained_federated_maps_with_federated_map(comp):
   r"""Replaces all the chained federated maps in `comp` with one federated map.
 
-  This transform traverses `comp` postorder, matches the following pattern `*`,
-  and replaces the following computation containing two federated map
-  intrinsics:
-
-            *Call
-            /    \
-  *Intrinsic     *Tuple
-                  |
-                  [Comp(x), *Call]
-                            /    \
-                  *Intrinsic     *Tuple
-                                  |
-                                  [Comp(y), Comp(z)]
-
-  federated_map(<x, federated_map(<y, z>)>)
-
-  with the following computation containing one federated map intrinsic:
+  This transform traverses `comp` postorder, matches the following pattern, and
+  replaces the following computation containing two federated map intrinsics:
 
             Call
            /    \
   Intrinsic      Tuple
                  |
-                 [Lambda(arg), Comp(z)]
-                             \
-                              Call
-                             /    \
-                      Comp(x)      Call
-                                  /    \
-                           Comp(y)      Ref(arg)
+                 [Comp(x), Call]
+                          /    \
+                 Intrinsic      Tuple
+                                |
+                                [Comp(y), Comp(z)]
 
-  federated_map(<(arg -> x(y(arg))), z>)
+  federated_map(<x, federated_map(<y, z>)>)
+
+  with the following computation containing one federated map intrinsic:
+
+
+                 Block ----------
+                /                \
+      [fn=Tuple]                  Call
+          |                      /    \
+  [Comp(x), Comp(y)]    Intrinsic      Tuple
+                                       |
+                                       [Lambda(arg), Comp(z)]
+                                                   \
+                                                    Call
+                                                   /    \
+                                             Sel(0)      Call
+                                            /           /    \
+                                     Ref(fn)      Sel(1)      Ref(arg)
+                                                 /
+                                          Ref(fn)
+
+  (let fn=<x, y> in federated_map(<(arg -> fn[0](fn[1](arg)))), z>)
 
   The functional computations `x` and `y`, and the argument `z` are retained;
   the other computations are replaced.
@@ -282,22 +286,51 @@ def replace_chained_federated_maps_with_federated_map(comp):
     """Returns a new transformed computation or `comp`."""
     if not _should_transform(comp):
       return comp
-    map_arg = comp.argument[1].argument[1]
-    inner_arg = computation_building_blocks.Reference(
-        'arg', map_arg.type_signature.member)
-    inner_fn = comp.argument[1].argument[0]
-    inner_call = computation_building_blocks.Call(inner_fn, inner_arg)
-    outer_fn = comp.argument[0]
-    outer_call = computation_building_blocks.Call(outer_fn, inner_call)
-    map_lambda = computation_building_blocks.Lambda(inner_arg.name,
-                                                    inner_arg.type_signature,
-                                                    outer_call)
-    map_tuple = computation_building_blocks.Tuple([map_lambda, map_arg])
-    map_intrinsic_type = computation_types.FunctionType(
-        map_tuple.type_signature, comp.function.type_signature.result)
-    map_intrinsic = computation_building_blocks.Intrinsic(
-        comp.function.uri, map_intrinsic_type)
-    return computation_building_blocks.Call(map_intrinsic, map_tuple)
+
+    def _create_lambda_to_chained_called_functions(functions):
+      r"""Constructs a lambda to a chain of called functional computations.
+
+         Lambda(arg)
+                    \
+                     Call
+                    /    \
+              Sel(0)      Call
+             /           /    \
+      Ref(fn)      Sel(1)      Ref(arg)
+                  /
+           Ref(fn)
+
+      (arg -> fn[0](fn[1](arg))))
+
+      Args:
+        functions: A `computation_building_blocks.Tuple` of functional
+          computations ordered from inner-most to outer-most.
+
+      Returns:
+        A `computation_building_blocks.Lambda`.
+      """
+      fn = computation_building_blocks.Reference('fn', functions.type_signature)
+      ref = computation_building_blocks.Reference(
+          'arg', functions[0].type_signature.parameter)
+      arg = ref
+      for index, _ in enumerate(functions):
+        sel = computation_building_blocks.Selection(fn, index=index)
+        call = computation_building_blocks.Call(sel, arg)
+        arg = call
+      return computation_building_blocks.Lambda(ref.name, ref.type_signature,
+                                                call)
+
+    functions = computation_building_blocks.Tuple((comp.argument[1].argument[0],
+                                                   comp.argument[0]))
+    fn = _create_lambda_to_chained_called_functions(functions)
+    arg = computation_building_blocks.Tuple(
+        [fn, comp.argument[1].argument[1]])
+    intrinsic_type = computation_types.FunctionType(
+        arg.type_signature, comp.function.type_signature.result)
+    intrinsic = computation_building_blocks.Intrinsic(comp.function.uri,
+                                                      intrinsic_type)
+    call = computation_building_blocks.Call(intrinsic, arg)
+    return computation_building_blocks.Block([('fn', functions)], call)
 
   return transformation_utils.transform_postorder(comp, _transform)
 
@@ -305,17 +338,17 @@ def replace_chained_federated_maps_with_federated_map(comp):
 def replace_tuple_intrinsics_with_intrinsic(comp):
   r"""Replaces all the tuples of intrinsics in `comp` with one intrinsic.
 
-  This transform traverses `comp` postorder, matches the following pattern `*`,
-  and replaces the following computation containing a tuple of called intrinsics
-  all represeting the same operation:
+  This transform traverses `comp` postorder, matches the following pattern, and
+  replaces the following computation containing a tuple of called intrinsics all
+  represeting the same operation:
 
-           *Tuple
-            |
-           *[Call,                        Call, ...]
-            /    \                       /    \
-  *Intrinsic      Tuple        *Intrinsic      Tuple
-                  |                            |
-         [Comp(f1), Comp(v1), ...]    [Comp(f2), Comp(v2), ...]
+           Tuple
+           |
+           [Call,                        Call, ...]
+           /    \                       /    \
+  Intrinsic      Tuple         Intrinsic      Tuple
+                 |                            |
+        [Comp(f1), Comp(v1), ...]    [Comp(f2), Comp(v2), ...]
 
   <Intrinsic(<f1, v1>), Intrinsic(<f2, v2>)>
 
